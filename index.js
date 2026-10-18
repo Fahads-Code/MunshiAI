@@ -34,6 +34,10 @@ admin.initializeApp({
 
 const app = express();
 
+app.get("/", (_req, res) => {
+  res.json({ message: "Munshi AI backend is running!" });
+});
+
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "http://localhost:5173")
   .split(",")
   .map((s) => s.trim())
