@@ -8,11 +8,14 @@ const PORT = process.env.PORT || 8787;
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-// llama-3.1-8b-instant has 30,000 TPM (5x more than 70B's 6,000 TPM) and responds in <400ms.
+// qwen/qwen3.8-27b responds in <350ms, understands Roman Urdu and multilingual nuances, and has high limits.
 const MODEL_CANDIDATES = [
   ...new Set(
     [
       process.env.GROQ_MODEL,
+      "qwen/qwen3.8-27b",
+      "openai/gpt-oss-20b",
+      "openai/gpt-oss-120b",
       "llama-3.1-8b-instant",
       "llama-3.3-70b-versatile",
     ].filter(Boolean),
@@ -231,7 +234,7 @@ app.post("/api/business-assistant", requireAuth, async (req, res) => {
   const facts = req.body?.facts;
   const input = req.body?.context;
 
-  if (!question || question.length > 500) {
+  if (!question || question.length > 600) {
     return res.status(400).json({ error: "Sawal valid nahi hai." });
   }
 
@@ -265,7 +268,7 @@ AHAM TAREEN QAWANEEN (100% ACCURACY):
         }
       }
 
-      // Try Groq with fast 8b model
+      // Try Groq with available fast models (qwen3.8-27b, gpt-oss-20b)
       const order = workingModel ? [workingModel] : MODEL_CANDIDATES;
       for (const model of order) {
         const groqRes = await callGroq(model, compactMessages, false);
