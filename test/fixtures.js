@@ -124,6 +124,7 @@ export const shopData = {
       userId: UID,
       customerId: null,
       customerName: "Walk-in Customer",
+      customerPhone: "03009998877",
       type: "GAVE",
       amount: 500,
       paid: 500,

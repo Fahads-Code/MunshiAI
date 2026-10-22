@@ -14,7 +14,7 @@ const ctx = { uid: UID, idToken: "fake-token" };
 const loadData = async () => shopData;
 
 test("definitions aur handlers match karte hain", () => {
-  assert.equal(FUNCTION_NAMES.length, 6);
+  assert.equal(FUNCTION_NAMES.length, 12);
   assert.equal(Object.keys(HANDLERS).length, FUNCTION_DEFINITIONS.length);
   for (const name of FUNCTION_NAMES) {
     assert.equal(typeof HANDLERS[name], "function");

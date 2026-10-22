@@ -83,16 +83,22 @@ export function normalizeShopData(raw = {}) {
         paid,
         customerId: t.customerId ? String(t.customerId) : null,
         customerName: String(t.customerName ?? "").trim().slice(0, 80),
+        customerPhone: typeof t.customerPhone === "string" ? t.customerPhone.slice(0, 30) : "",
+        walkIn: !t.customerId,
         createdAt: isoDate(t.createdAt),
         items: (Array.isArray(t.items) ? t.items : [])
           .filter((i) => i && typeof i === "object")
           .slice(0, 100)
-          .map((i) => ({
-            name: String(i.name ?? "").slice(0, 60),
-            qty: round2(num(i.qty)),
-            unit: String(i.unit ?? "pc").slice(0, 20),
-            price: round2(num(i.price)),
-          })),
+          .map((i) => {
+            const cost = i.cost === undefined || i.cost === null ? null : round2(num(i.cost));
+            return {
+              name: String(i.name ?? "").slice(0, 60),
+              qty: round2(num(i.qty)),
+              unit: String(i.unit ?? "pc").slice(0, 20),
+              price: round2(num(i.price)),
+              ...(cost === null ? {} : { cost }),
+            };
+          }),
         profit: t.profit === null || t.profit === undefined ? null : round2(num(t.profit)),
         profitEstimated: t.profitEstimated === true,
         source: typeof t.source === "string" ? t.source : null,
@@ -124,11 +130,14 @@ function inRange(iso, fromMs, toMs) {
 
 function customerTx(data, customer) {
   const name = norm(customer.name);
-  return data.transactions.filter(
-    (t) =>
-      (t.customerId && t.customerId === customer.id) ||
-      (!t.customerId && norm(t.customerName) === name),
-  );
+  const phone = phoneTail(customer.phone);
+  return data.transactions.filter((t) => {
+    if (t.customerId) return t.customerId === customer.id;
+    if (norm(t.customerName) !== name) return false;
+    // Legacy entries jinka customerId nahi tha: sirf tab jodein jab phone match kare,
+    // warna kisi walk-in ka bill ghalat customer ke khate mein chala jayega.
+    return phone.length >= 7 && phoneTail(t.customerPhone) === phone;
+  });
 }
 
 function lastTxOf(data, customer) {
@@ -374,6 +383,14 @@ export function getSalesSummary(data, args, now = new Date()) {
       .sort((a, b) => b.revenue - a.revenue)
       .slice(0, 5),
     recentSales: sales.slice(0, 5).map(summarizeTx),
+    summary:
+      `${range.label}: kul sale ${formatRs(totalSales)} (${sales.length} bills), ` +
+      `sale ke waqt cash ${formatRs(cashAtSale)}, udhaar ${formatRs(creditGiven)}, ` +
+      `purani wasooli ${formatRs(recovery)}, kharchay ${formatRs(expenseTotal)}. ` +
+      (profitComplete
+        ? `Munafa ${formatRs(grossProfit)}${profitEstimated ? " (kuch takhmina)" : ""}; ` +
+          `kharchon ke baad net ${formatRs(grossProfit - expenseTotal)}.`
+        : "Kuch entries ka cost saved nahi, is liye mukammal munafa maloom nahi."),
   };
 }
 
@@ -473,6 +490,881 @@ export function listPayments(data, args, now = new Date()) {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/* Complete database query layer                                       */
+/* ------------------------------------------------------------------ */
+
+const phoneTail = (value) => {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  return digits.length > 10 ? digits.slice(-10) : digits;
+};
+
+function phoneMatches(stored, query) {
+  const q = String(query ?? "").replace(/\D/g, "");
+  if (!q) return true;
+  const s = String(stored ?? "").replace(/\D/g, "");
+  if (!s) return false;
+  const variants = new Set([q, q.replace(/^0+/, ""), phoneTail(q)]);
+  for (const v of variants) {
+    if (v && (s.includes(v) || phoneTail(s).includes(v))) return true;
+  }
+  return false;
+}
+
+const dateMs = (iso) => {
+  const t = Date.parse(String(iso ?? ""));
+  return Number.isFinite(t) ? t : 0;
+};
+
+const textHas = (haystack, needle) => {
+  const q = norm(needle);
+  return !q || norm(haystack).includes(q);
+};
+
+function txKindOf(tx) {
+  if (tx.type === "GAVE") return "sale";
+  return isSalePayment(tx) ? "sale-payment" : "payment";
+}
+
+/** Walk-in customer ko phone/naam se pehchaan; bina pehchaan wala har bill alag. */
+function buyerKey(tx) {
+  if (tx.customerId) return `id:${tx.customerId}`;
+  const phone = phoneTail(tx.customerPhone);
+  if (phone.length >= 7) return `phone:${phone}`;
+  const name = norm(tx.customerName);
+  if (name && name !== "walk in customer") return `name:${name}`;
+  return `entry:${tx.id}`;
+}
+
+function txPhone(tx, customerById) {
+  return (
+    tx.customerPhone ||
+    (tx.customerId ? customerById.get(tx.customerId)?.phone : "") ||
+    ""
+  );
+}
+
+function txRecord(tx, customerById) {
+  const due = tx.type === "GAVE" ? Math.max(0, tx.amount - tx.paid) : 0;
+  return {
+    id: tx.id,
+    date: tx.createdAt,
+    kind: txKindOf(tx),
+    walkIn: tx.walkIn === true,
+    customerId: tx.customerId,
+    customerName:
+      tx.customerName || (tx.customerId ? "Customer" : "Walk-in Customer"),
+    phone: txPhone(tx, customerById) || null,
+    amount: round2(tx.amount),
+    paid: round2(tx.paid),
+    due: round2(due),
+    itemsText:
+      tx.items
+        .map((i) => `${i.name} ${i.qty} ${i.unit} @ ${i.price}`)
+        .join(", ") || null,
+    receiptNo: tx.receiptNo || null,
+    note: tx.note || null,
+  };
+}
+
+const fmtDate = (iso) => {
+  if (!iso) return null;
+  try {
+    return new Date(iso).toLocaleDateString("en-PK", {
+      timeZone: "Asia/Karachi",
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    });
+  } catch {
+    return String(iso).slice(0, 10);
+  }
+};
+
+function emptyStats(customer) {
+  return {
+    customer,
+    salesTotal: 0,
+    cashAtSale: 0,
+    creditGiven: 0,
+    recovered: 0,
+    bills: 0,
+    payments: 0,
+    firstActivity: null,
+    lastActivity: null,
+    items: new Map(),
+  };
+}
+
+/**
+ * Har customer ke lifetime totals ek dafa calculate karta hai.
+ * Sirf transactions jinka customerId customer record se match karta hai.
+ */
+function buildCustomerStats(data) {
+  const map = new Map();
+  for (const customer of data.customers) map.set(customer.id, emptyStats(customer));
+
+  for (const t of data.transactions) {
+    const row = t.customerId ? map.get(t.customerId) : null;
+    if (!row) continue;
+
+    const at = dateMs(t.createdAt);
+    if (at) {
+      if (!row.firstActivity || at < row.firstActivity) row.firstActivity = at;
+      if (!row.lastActivity || at > row.lastActivity) row.lastActivity = at;
+    }
+
+    if (t.type === "GAVE") {
+      row.salesTotal += t.amount;
+      row.cashAtSale += t.paid;
+      row.creditGiven += Math.max(0, t.amount - t.paid);
+      row.bills += 1;
+      for (const item of t.items) {
+        const key = `${norm(item.name)}|${item.unit}`;
+        const ir = row.items.get(key) ?? {
+          name: item.name,
+          unit: item.unit,
+          qty: 0,
+          revenue: 0,
+        };
+        ir.qty = round2(ir.qty + item.qty);
+        ir.revenue = round2(ir.revenue + item.qty * item.price);
+        row.items.set(key, ir);
+      }
+    } else if (!isSalePayment(t)) {
+      row.recovered += t.amount;
+      row.payments += 1;
+    }
+  }
+
+  return map;
+}
+
+function statsRecord(row) {
+  const c = row.customer;
+  return {
+    id: c.id,
+    name: c.name,
+    phone: c.phone || null,
+    balance: round2(c.totalBalance),
+    balanceInfo: balanceInfo(c.totalBalance),
+    salesTotal: round2(row.salesTotal),
+    cashAtSale: round2(row.cashAtSale),
+    creditGiven: round2(row.creditGiven),
+    recovered: round2(row.recovered),
+    bills: row.bills,
+    payments: row.payments,
+    avgBill: row.bills ? round2(row.salesTotal / row.bills) : 0,
+    firstActivity: row.firstActivity
+      ? new Date(row.firstActivity).toISOString()
+      : null,
+    lastActivity: row.lastActivity
+      ? new Date(row.lastActivity).toISOString()
+      : null,
+  };
+}
+
+function resolveCustomerForProfile(data, args) {
+  if (args.customerId) {
+    const customer =
+      data.customers.find((c) => c.id === args.customerId) || null;
+    return customer
+      ? { customer }
+      : {
+          error: {
+            found: false,
+            reason: `Is customerId (${args.customerId}) ka koi record nahi mila.`,
+          },
+        };
+  }
+
+  if (args.phone) {
+    const matches = data.customers.filter((c) => phoneMatches(c.phone, args.phone));
+    if (matches.length === 1) return { customer: matches[0] };
+    if (matches.length > 1) return { ambiguous: matches };
+  }
+
+  if (args.customerName) {
+    const matches = matchCustomers(data, args.customerName);
+    if (matches.length === 0) {
+      return {
+        error: {
+          found: false,
+          reason: `"${args.customerName}" naam ka koi customer records mein nahi mila.`,
+        },
+      };
+    }
+    const topScore = matches[0].score;
+    const topMatches = matches.filter((m) => m.score === topScore);
+    if (topMatches.length > 1) {
+      return { ambiguous: topMatches.map((m) => m.customer) };
+    }
+    return { customer: matches[0].customer };
+  }
+
+  return {
+    error: {
+      found: false,
+      reason: "customerId, customerName ya phone mein se kam az kam ek dena zaroori hai.",
+    },
+  };
+}
+
+const CUSTOMER_SORTS = {
+  balanceDesc: (a, b) => b.customer.totalBalance - a.customer.totalBalance,
+  balanceAsc: (a, b) => a.customer.totalBalance - b.customer.totalBalance,
+  salesDesc: (a, b) => b.salesTotal - a.salesTotal,
+  billsDesc: (a, b) => b.bills - a.bills,
+  recent: (a, b) => (b.lastActivity ?? 0) - (a.lastActivity ?? 0),
+  nameAsc: (a, b) => a.customer.name.localeCompare(b.customer.name),
+  nameDesc: (a, b) => b.customer.name.localeCompare(a.customer.name),
+};
+
+export function queryCustomers(data, args) {
+  const limit = args.limit ?? 20;
+  const offset = args.offset ?? 0;
+  const kind = args.balanceKind ?? "any";
+  const stats = buildCustomerStats(data);
+
+  let rows = data.customers.map((c) => stats.get(c.id)).filter(Boolean);
+
+  if (args.name) rows = rows.filter((r) => textHas(r.customer.name, args.name));
+  if (args.phone) rows = rows.filter((r) => phoneMatches(r.customer.phone, args.phone));
+
+  if (args.search) {
+    rows = rows.filter(
+      (r) =>
+        textHas(r.customer.name, args.search) ||
+        phoneMatches(r.customer.phone, args.search) ||
+        [...r.items.values()].some((i) => textHas(i.name, args.search)),
+    );
+  }
+
+  if (kind === "receivable") {
+    rows = rows.filter((r) => r.customer.totalBalance > EPS);
+  } else if (kind === "payable") {
+    rows = rows.filter((r) => r.customer.totalBalance < -EPS);
+  } else if (kind === "settled") {
+    rows = rows.filter((r) => Math.abs(r.customer.totalBalance) <= EPS);
+  }
+
+  if (typeof args.minBalance === "number") {
+    rows = rows.filter((r) => r.customer.totalBalance >= args.minBalance);
+  }
+  if (typeof args.maxBalance === "number") {
+    rows = rows.filter((r) => r.customer.totalBalance <= args.maxBalance);
+  }
+  if (args.hasPhone === true) {
+    rows = rows.filter((r) => phoneTail(r.customer.phone).length >= 7);
+  } else if (args.hasPhone === false) {
+    rows = rows.filter((r) => phoneTail(r.customer.phone).length < 7);
+  }
+
+  rows.sort(CUSTOMER_SORTS[args.sort] ?? CUSTOMER_SORTS.balanceDesc);
+
+  const receivable = rows.filter((r) => r.customer.totalBalance > EPS);
+  const payable = rows.filter((r) => r.customer.totalBalance < -EPS);
+  const totalReceivable = round2(
+    receivable.reduce((s, r) => s + r.customer.totalBalance, 0),
+  );
+  const totalPayable = round2(
+    payable.reduce((s, r) => s + Math.abs(r.customer.totalBalance), 0),
+  );
+
+  const page = rows.slice(offset, offset + limit);
+  const hasMore = offset + page.length < rows.length;
+
+  return {
+    matched: rows.length,
+    shown: page.length,
+    offset,
+    nextOffset: hasMore ? offset + page.length : null,
+    hasMore,
+    totals: {
+      receivable: totalReceivable,
+      receivableCustomers: receivable.length,
+      payable: totalPayable,
+      payableCustomers: payable.length,
+      settledCustomers: rows.filter((r) => Math.abs(r.customer.totalBalance) <= EPS)
+        .length,
+      salesTotal: round2(rows.reduce((s, r) => s + r.salesTotal, 0)),
+      recovered: round2(rows.reduce((s, r) => s + r.recovered, 0)),
+    },
+    customers: page.map(statsRecord),
+    summary:
+      `${rows.length} customer match hue. ` +
+      `${receivable.length} se kul ${formatRs(totalReceivable)} lene hain; ` +
+      `${payable.length} ko kul ${formatRs(totalPayable)} dene hain; ` +
+      `${rows.filter((r) => Math.abs(r.customer.totalBalance) <= EPS).length} ka hisaab barabar hai. ` +
+      `${page.length} customers dikhaye gaye hain` +
+      (hasMore ? `; agli list ke liye offset ${offset + page.length} use karein.` : "."),
+  };
+}
+
+const TX_SORTS = {
+  newest: (a, b) => dateMs(b.createdAt) - dateMs(a.createdAt),
+  oldest: (a, b) => dateMs(a.createdAt) - dateMs(b.createdAt),
+  amountDesc: (a, b) => b.amount - a.amount,
+  amountAsc: (a, b) => a.amount - b.amount,
+};
+
+export function queryTransactions(data, args, now = new Date()) {
+  const limit = args.limit ?? 10;
+  const offset = args.offset ?? 0;
+  const kind = args.type ?? "any";
+  const range = resolvePeriod({ ...args, period: args.period ?? "allTime" }, now);
+  const customerById = new Map(data.customers.map((c) => [c.id, c]));
+
+  let rows = data.transactions.filter((t) =>
+    inRange(t.createdAt, range.fromMs, range.toMs),
+  );
+
+  if (kind !== "any") rows = rows.filter((t) => txKindOf(t) === kind);
+  if (args.customerId) rows = rows.filter((t) => t.customerId === args.customerId);
+  if (args.customerName) {
+    rows = rows.filter((t) => textHas(t.customerName, args.customerName));
+  }
+  if (typeof args.walkIn === "boolean") {
+    rows = rows.filter((t) => (t.walkIn === true) === args.walkIn);
+  }
+  if (args.phone) {
+    rows = rows.filter((t) =>
+      phoneMatches(txPhone(t, customerById), args.phone),
+    );
+  }
+  if (args.itemName) {
+    rows = rows.filter((t) =>
+      t.items.some((i) => textHas(i.name, args.itemName)),
+    );
+  }
+  if (args.receiptNo) {
+    rows = rows.filter((t) => textHas(t.receiptNo || "", args.receiptNo));
+  }
+  if (args.search) {
+    rows = rows.filter((t) => {
+      const haystacks = [
+        t.customerName,
+        txPhone(t, customerById),
+        t.note,
+        t.receiptNo || "",
+        ...t.items.map((i) => i.name),
+      ];
+      return haystacks.some((h) => textHas(h, args.search));
+    });
+  }
+  if (typeof args.minAmount === "number") {
+    rows = rows.filter((t) => t.amount >= args.minAmount);
+  }
+  if (typeof args.maxAmount === "number") {
+    rows = rows.filter((t) => t.amount <= args.maxAmount);
+  }
+
+  rows.sort(TX_SORTS[args.sort] ?? TX_SORTS.newest);
+
+  const sales = rows.filter((t) => t.type === "GAVE");
+  const payments = rows.filter((t) => t.type === "GOT" && !isSalePayment(t));
+  const salePayments = rows.filter((t) => t.type === "GOT" && isSalePayment(t));
+
+  const totals = {
+    matched: rows.length,
+    bills: sales.length,
+    salesTotal: round2(sales.reduce((s, t) => s + t.amount, 0)),
+    cashAtSale: round2(sales.reduce((s, t) => s + t.paid, 0)),
+    creditGiven: round2(
+      sales.reduce((s, t) => s + Math.max(0, t.amount - t.paid), 0),
+    ),
+    recovered: round2(payments.reduce((s, t) => s + t.amount, 0)),
+    salePayments: round2(salePayments.reduce((s, t) => s + t.amount, 0)),
+    buyers: new Set(rows.map(buyerKey)).size,
+  };
+
+  const page = rows.slice(offset, offset + limit);
+  const hasMore = offset + page.length < rows.length;
+
+  return {
+    period: {
+      key: range.key,
+      label: range.label,
+      from: range.from,
+      to: range.to,
+    },
+    matched: rows.length,
+    shown: page.length,
+    offset,
+    nextOffset: hasMore ? offset + page.length : null,
+    hasMore,
+    totals,
+    transactions: page.map((t) => txRecord(t, customerById)),
+    summary:
+      `${range.label}: ${rows.length} entries mile (${sales.length} sale bills). ` +
+      `Kul sale ${formatRs(totals.salesTotal)}, sale ke waqt cash ${formatRs(totals.cashAtSale)}, ` +
+      `udhaar ${formatRs(totals.creditGiven)}, purani wasooli ${formatRs(totals.recovered)}, ` +
+      `sale-cash ${formatRs(totals.salePayments)}. ` +
+      `${page.length} entries dikhayi gayi hain` +
+      (hasMore ? `; agli entries offset ${offset + page.length} se milengi.` : "."),
+  };
+}
+
+export function getCustomerProfile(data, args) {
+  const resolved = resolveCustomerForProfile(data, args);
+
+  if (resolved.error) return resolved.error;
+  if (resolved.ambiguous) {
+    return {
+      found: false,
+      ambiguous: true,
+      matches: resolved.ambiguous.slice(0, 10).map((c) => ({
+        id: c.id,
+        name: c.name,
+        phone: c.phone || null,
+        balance: c.totalBalance,
+        balanceInfo: balanceInfo(c.totalBalance),
+      })),
+      note: "Ek se zyada customer mile hain. customerId de kar dobara poocho.",
+    };
+  }
+
+  const customer = resolved.customer;
+  const stats = buildCustomerStats(data).get(customer.id);
+  const customerById = new Map(data.customers.map((c) => [c.id, c]));
+  const entries = customerTx(data, customer);
+  const phone =
+    customer.phone ||
+    entries.find((t) => t.customerPhone)?.customerPhone ||
+    "";
+  const includeEntries = args.includeEntries !== false;
+  const entriesLimit = args.entriesLimit ?? 10;
+
+  const lifetime = stats
+    ? {
+        salesTotal: round2(stats.salesTotal),
+        cashAtSale: round2(stats.cashAtSale),
+        creditGiven: round2(stats.creditGiven),
+        recovered: round2(stats.recovered),
+        bills: stats.bills,
+        payments: stats.payments,
+        avgBill: stats.bills ? round2(stats.salesTotal / stats.bills) : 0,
+        firstVisit: stats.firstActivity
+          ? new Date(stats.firstActivity).toISOString()
+          : null,
+        lastVisit: stats.lastActivity
+          ? new Date(stats.lastActivity).toISOString()
+          : null,
+      }
+    : null;
+
+  const topItems = stats
+    ? [...stats.items.values()]
+        .sort((a, b) => b.revenue - a.revenue)
+        .slice(0, 5)
+    : [];
+
+  const balance = customer.totalBalance;
+  const result = {
+    found: true,
+    customer: {
+      id: customer.id,
+      name: customer.name,
+      phone: phone || null,
+      customerSince: customer.createdAt,
+    },
+    balance: balanceInfo(balance),
+    pending: {
+      receivable: round2(Math.max(0, balance)),
+      payable: round2(Math.max(0, -balance)),
+    },
+    lifetime,
+    topItems,
+    entriesCount: entries.length,
+    summary:
+      `${customer.name}${phone ? ` (${phone})` : " (phone saved nahi)"}: ` +
+      `${balanceInfo(balance).label}. ` +
+      (lifetime
+        ? `Ab tak ${formatRs(lifetime.salesTotal)} ki sale, ${formatRs(
+            lifetime.creditGiven,
+          )} udhaar, ${formatRs(lifetime.recovered)} wasooli; ${lifetime.bills} bills. `
+        : "") +
+      `Aakhri activity: ${
+        lifetime?.lastVisit ? fmtDate(lifetime.lastVisit) : "koi entry nahi"
+      }.`,
+  };
+
+  if (includeEntries) {
+    result.entries = entries
+      .slice(0, entriesLimit)
+      .map((t) => txRecord(t, customerById));
+  }
+
+  return result;
+}
+
+export function getItemReport(data, args, now = new Date()) {
+  const limit = args.limit ?? 10;
+  const range = resolvePeriod({ ...args, period: args.period ?? "allTime" }, now);
+  const customerById = new Map(data.customers.map((c) => [c.id, c]));
+  const rows = new Map();
+  const matchedBills = new Set();
+  const allBuyers = new Set();
+
+  for (const t of data.transactions) {
+    if (t.type !== "GAVE") continue;
+    if (!inRange(t.createdAt, range.fromMs, range.toMs)) continue;
+
+    for (const item of t.items) {
+      if (args.itemName && !textHas(item.name, args.itemName)) continue;
+
+      const key = `${norm(item.name)}|${item.unit}`;
+      let row = rows.get(key);
+      if (!row) {
+        row = {
+          name: item.name,
+          unit: item.unit,
+          qty: 0,
+          revenue: 0,
+          costTotal: 0,
+          costKnown: true,
+          bills: new Set(),
+          buyers: new Map(),
+          lastSold: null,
+        };
+        rows.set(key, row);
+      }
+
+      row.qty = round2(row.qty + item.qty);
+      row.revenue = round2(row.revenue + item.qty * item.price);
+      if (item.cost === undefined || item.cost === null) {
+        row.costKnown = false;
+      } else {
+        row.costTotal = round2(row.costTotal + item.qty * item.cost);
+      }
+      row.bills.add(t.id);
+      matchedBills.add(t.id);
+
+      const bk = buyerKey(t);
+      allBuyers.add(bk);
+      const buyer = row.buyers.get(bk) ?? {
+        name: t.customerName || "Walk-in Customer",
+        phone: txPhone(t, customerById) || null,
+        qty: 0,
+        revenue: 0,
+        bills: 0,
+      };
+      buyer.qty = round2(buyer.qty + item.qty);
+      buyer.revenue = round2(buyer.revenue + item.qty * item.price);
+      buyer.bills += 1;
+      row.buyers.set(bk, buyer);
+
+      if (!row.lastSold || dateMs(t.createdAt) > dateMs(row.lastSold)) {
+        row.lastSold = t.createdAt;
+      }
+    }
+  }
+
+  const list = [...rows.values()].map((r) => ({
+    name: r.name,
+    unit: r.unit,
+    qty: r.qty,
+    revenue: r.revenue,
+    bills: r.bills.size,
+    buyers: r.buyers.size,
+    profit: r.costKnown ? round2(r.revenue - r.costTotal) : null,
+    profitNote: r.costKnown
+      ? null
+      : "Kuch entries ka purchase cost saved nahi, is liye asli munafa maloom nahi.",
+    lastSold: r.lastSold,
+    topBuyers: [...r.buyers.values()]
+      .sort((a, b) => b.revenue - a.revenue)
+      .slice(0, 3),
+  }));
+
+  const sorters = {
+    revenue: (a, b) => b.revenue - a.revenue,
+    qty: (a, b) => b.qty - a.qty,
+    profit: (a, b) => (b.profit ?? -1) - (a.profit ?? -1),
+    buyers: (a, b) => b.buyers - a.buyers,
+  };
+  list.sort(sorters[args.sort] ?? sorters.revenue);
+
+  const page = list.slice(0, limit);
+  const totalRevenue = round2(list.reduce((s, i) => s + i.revenue, 0));
+  const totalQty = round2(list.reduce((s, i) => s + i.qty, 0));
+  const profitComplete = list.length > 0 && list.every((i) => i.profit !== null);
+  const totalProfit = profitComplete
+    ? round2(list.reduce((s, i) => s + i.profit, 0))
+    : null;
+
+  return {
+    period: {
+      key: range.key,
+      label: range.label,
+      from: range.from,
+      to: range.to,
+    },
+    matched: list.length,
+    shown: page.length,
+    totals: {
+      itemTypes: list.length,
+      bills: matchedBills.size,
+      buyers: allBuyers.size,
+      qty: totalQty,
+      revenue: totalRevenue,
+      profit: totalProfit,
+    },
+    items: page,
+    summary:
+      `${range.label}: ${list.length} qism ke items biken. ` +
+      `Kul sale ${formatRs(totalRevenue)}, kul quantity ${totalQty}, ` +
+      `${matchedBills.size} bills, ${allBuyers.size} buyers. ` +
+      (profitComplete
+        ? `Asli munafa ${formatRs(totalProfit)}. `
+        : "Kuch items ka cost saved nahi, is liye mukammal munafa maloom nahi. ") +
+      (page.length
+        ? `Sab se aage: ${page
+            .slice(0, 3)
+            .map((i) => `${i.name} (${formatRs(i.revenue)})`)
+            .join(", ")}.`
+        : "Is filter par koi item nahi mila."),
+  };
+}
+
+const EXPENSE_SORTS = {
+  newest: (a, b) => dateMs(b.createdAt) - dateMs(a.createdAt),
+  oldest: (a, b) => dateMs(a.createdAt) - dateMs(b.createdAt),
+  amountDesc: (a, b) => b.amount - a.amount,
+  amountAsc: (a, b) => a.amount - b.amount,
+};
+
+export function getExpenseReport(data, args, now = new Date()) {
+  const limit = args.limit ?? 20;
+  const offset = args.offset ?? 0;
+  const range = resolvePeriod({ ...args, period: args.period ?? "allTime" }, now);
+
+  let rows = data.expenses.filter((e) =>
+    inRange(e.createdAt, range.fromMs, range.toMs),
+  );
+  if (args.category) {
+    rows = rows.filter((e) => textHas(e.category, args.category));
+  }
+  if (args.search) {
+    rows = rows.filter(
+      (e) => textHas(e.category, args.search) || textHas(e.note, args.search),
+    );
+  }
+
+  const byCategory = new Map();
+  for (const e of rows) {
+    const key = e.category || "Other";
+    const row = byCategory.get(key) ?? { category: key, total: 0, entries: 0 };
+    row.total = round2(row.total + e.amount);
+    row.entries += 1;
+    byCategory.set(key, row);
+  }
+
+  const total = round2(rows.reduce((s, e) => s + e.amount, 0));
+  const sorted = [...rows].sort(
+    EXPENSE_SORTS[args.sort] ?? EXPENSE_SORTS.newest,
+  );
+  const page = sorted.slice(offset, offset + limit);
+  const hasMore = offset + page.length < sorted.length;
+  const categories = [...byCategory.values()].sort((a, b) => b.total - a.total);
+
+  return {
+    period: {
+      key: range.key,
+      label: range.label,
+      from: range.from,
+      to: range.to,
+    },
+    matched: rows.length,
+    shown: page.length,
+    offset,
+    nextOffset: hasMore ? offset + page.length : null,
+    hasMore,
+    totals: { total, entries: rows.length, categories: categories.length },
+    byCategory: categories,
+    expenses: page.map((e) => ({
+      id: e.id,
+      date: e.createdAt,
+      category: e.category,
+      amount: e.amount,
+      note: e.note || null,
+    })),
+    summary:
+      `${range.label}: ${rows.length} kharchay, kul ${formatRs(total)}. ` +
+      (categories.length
+        ? `Sab se bara: ${categories
+            .slice(0, 3)
+            .map((c) => `${c.category} ${formatRs(c.total)}`)
+            .join(", ")}. `
+        : "") +
+      `${page.length} entries dikhayi gayi hain` +
+      (hasMore ? `; agli entries offset ${offset + page.length} se.` : "."),
+  };
+}
+
+export function getDatabaseOverview(data) {
+  const customerById = new Map(data.customers.map((c) => [c.id, c]));
+
+  const sales = data.transactions.filter((t) => t.type === "GAVE");
+  const payments = data.transactions.filter(
+    (t) => t.type === "GOT" && !isSalePayment(t),
+  );
+  const salePayments = data.transactions.filter(
+    (t) => t.type === "GOT" && isSalePayment(t),
+  );
+
+  const salesTotal = round2(sales.reduce((s, t) => s + t.amount, 0));
+  const cashAtSale = round2(sales.reduce((s, t) => s + t.paid, 0));
+  const creditGiven = round2(
+    sales.reduce((s, t) => s + Math.max(0, t.amount - t.paid), 0),
+  );
+  const recovered = round2(payments.reduce((s, t) => s + t.amount, 0));
+  const salePaymentsTotal = round2(
+    salePayments.reduce((s, t) => s + t.amount, 0),
+  );
+  const expensesTotal = round2(data.expenses.reduce((s, e) => s + e.amount, 0));
+
+  const profitComplete = sales.every((t) => t.profit !== null);
+  const grossProfit = round2(sales.reduce((s, t) => s + (t.profit ?? 0), 0));
+  const profitEstimated = sales.some((t) => t.profitEstimated);
+
+  const timestamps = data.transactions
+    .map((t) => dateMs(t.createdAt))
+    .filter((t) => t > 0);
+  const firstAt = timestamps.length
+    ? timestamps.reduce((min, t) => (t < min ? t : min), timestamps[0])
+    : null;
+  const lastAt = timestamps.length
+    ? timestamps.reduce((max, t) => (t > max ? t : max), timestamps[0])
+    : null;
+
+  const walkInSales = sales.filter((t) => t.walkIn === true);
+  const walkInKeys = new Map();
+  for (const t of walkInSales) {
+    const key = buyerKey(t);
+    const row = walkInKeys.get(key) ?? {
+      key,
+      phone: phoneTail(txPhone(t, customerById)),
+      name: t.customerName,
+      bills: 0,
+      amount: 0,
+    };
+    row.bills += 1;
+    row.amount = round2(row.amount + t.amount);
+    walkInKeys.set(key, row);
+  }
+  const identified = [...walkInKeys.values()].filter(
+    (r) => !r.key.startsWith("entry:"),
+  );
+  const withPhone = identified.filter((r) => r.phone.length >= 7);
+
+  const itemsMissingCost = sales.reduce(
+    (count, t) =>
+      count + t.items.filter((i) => i.cost === undefined).length,
+    0,
+  );
+
+  const orphans = data.transactions.filter(
+    (t) => t.customerId && !customerById.has(t.customerId),
+  ).length;
+
+  const customersMissingPhone = data.customers.filter(
+    (c) => phoneTail(c.phone).length < 7,
+  ).length;
+
+  const walkInMissingPhone = walkInSales.filter(
+    (t) => phoneTail(t.customerPhone).length < 7,
+  ).length;
+
+  const unreadableDates = data.transactions.filter(
+    (t) => !dateMs(t.createdAt),
+  ).length;
+
+  return {
+    generatedAt: new Date().toISOString(),
+    coverage: {
+      customers: data.customers.length,
+      transactions: data.transactions.length,
+      expenses: data.expenses.length,
+      firstTransactionAt: firstAt ? new Date(firstAt).toISOString() : null,
+      lastTransactionAt: lastAt ? new Date(lastAt).toISOString() : null,
+    },
+    counts: {
+      sales: sales.length,
+      payments: payments.length,
+      salePayments: salePayments.length,
+      receipts: new Set(sales.map((t) => t.receiptNo).filter(Boolean)).size,
+      customersWithDues: data.customers.filter((c) => c.totalBalance > EPS)
+        .length,
+      customersWithAdvance: data.customers.filter((c) => c.totalBalance < -EPS)
+        .length,
+      settledCustomers: data.customers.filter(
+        (c) => Math.abs(c.totalBalance) <= EPS,
+      ).length,
+    },
+    money: {
+      salesTotal,
+      cashAtSale,
+      creditGiven,
+      recovered,
+      salePaymentsAtSale: salePaymentsTotal,
+      expenses: expensesTotal,
+      grossProfit: profitComplete ? grossProfit : null,
+      netProfit: profitComplete ? round2(grossProfit - expensesTotal) : null,
+      profitEstimated,
+      receivableTotal: round2(
+        data.customers
+          .filter((c) => c.totalBalance > EPS)
+          .reduce((s, c) => s + c.totalBalance, 0),
+      ),
+      payableTotal: round2(
+        data.customers
+          .filter((c) => c.totalBalance < -EPS)
+          .reduce((s, c) => s + Math.abs(c.totalBalance), 0),
+      ),
+    },
+    walkIn: {
+      bills: walkInSales.length,
+      amount: round2(walkInSales.reduce((s, t) => s + t.amount, 0)),
+      uniqueIdentifiedCustomers: identified.length,
+      withPhone: withPhone.length,
+      repeatCustomers: identified.filter((r) => r.bills > 1).length,
+      anonymousBills: walkInSales.length - identified.reduce((s, r) => s + r.bills, 0),
+      customers: identified
+        .sort((a, b) => b.amount - a.amount)
+        .slice(0, 10)
+        .map((r) => ({
+          name: r.name || "Walk-in Customer",
+          phone: r.phone || null,
+          bills: r.bills,
+          amount: r.amount,
+        })),
+    },
+    dataQuality: {
+      customersMissingPhone,
+      walkInMissingPhoneBills: walkInMissingPhone,
+      itemsMissingCost,
+      transactionsMissingDate: unreadableDates,
+      transactionsWithUnknownCustomer: orphans,
+    },
+    summary:
+      `Database mein ${data.customers.length} customers, ${data.transactions.length} transactions ` +
+      `aur ${data.expenses.length} expenses hain. ` +
+      `Data ${fmtDate(firstAt ? new Date(firstAt).toISOString() : null) ?? "shuru"} se ` +
+      `${fmtDate(lastAt ? new Date(lastAt).toISOString() : null) ?? "ab tak"} tak hai. ` +
+      `Ab tak sale ${formatRs(salesTotal)}, sale ke waqt cash ${formatRs(
+        cashAtSale,
+      )}, udhaar ${formatRs(creditGiven)}, wasooli ${formatRs(recovered)}, ` +
+      `kharchay ${formatRs(expensesTotal)}, ` +
+      (profitComplete
+        ? `munafa ${formatRs(grossProfit)}${profitEstimated ? " (kuch takhmina)" : ""}. `
+        : "munafa mukammal maloom nahi (cost missing). ") +
+      `Walk-in: ${walkInSales.length} bills, ${identified.length} pehchane gaye customers, ` +
+      `un mein ${withPhone.length} ke phone saved hain. ` +
+      `${customersMissingPhone} customers ke phone saved nahi.`,
+  };
+}
+
 export const HANDLERS = {
   searchCustomer,
   calculateBalance,
@@ -480,6 +1372,12 @@ export const HANDLERS = {
   listDefaulters,
   listCreditCustomers,
   listPayments,
+  queryTransactions,
+  queryCustomers,
+  getCustomerProfile,
+  getItemReport,
+  getExpenseReport,
+  getDatabaseOverview,
 };
 
 /** Sanity check: handlers ke naam definitions se match karein. */

@@ -2,11 +2,17 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   calculateBalance,
+  getCustomerProfile,
+  getDatabaseOverview,
+  getExpenseReport,
+  getItemReport,
   getSalesSummary,
   listCreditCustomers,
   listDefaulters,
   listPayments,
   normalizeShopData,
+  queryCustomers,
+  queryTransactions,
   searchCustomer,
 } from "../src/functions/handlers.js";
 import { resolvePeriod, startOfPktDay } from "../src/functions/period.js";
@@ -221,4 +227,190 @@ test("normalizeShopData: bad values safe rehti hain", () => {
   assert.equal(clean.transactions[0].items.length, 1);
   assert.equal(clean.transactions[0].items[0].price, 10.56);
   assert.equal(clean.expenses[0].amount, 12.35);
+});
+
+/* ------------------------------------------------------------------ */
+/* Complete database query layer                                       */
+/* ------------------------------------------------------------------ */
+
+test("queryTransactions: aaj ki entries, exact totals aur pagination", () => {
+  const today = queryTransactions(data, { period: "today" }, NOW);
+  assert.equal(today.matched, 4);
+  assert.equal(today.totals.bills, 2);
+  assert.equal(today.totals.salesTotal, 3500);
+  assert.equal(today.totals.cashAtSale, 1500);
+  assert.equal(today.totals.creditGiven, 2000);
+  assert.equal(today.totals.recovered, 500);
+  assert.equal(today.totals.salePayments, 1000);
+  assert.match(today.summary, /Rs\. 3,500/);
+
+  const page = queryTransactions(data, { period: "today", limit: 2 }, NOW);
+  assert.equal(page.shown, 2);
+  assert.equal(page.matched, 4);
+  assert.equal(page.hasMore, true);
+  assert.equal(page.nextOffset, 2);
+});
+
+test("queryTransactions: walk-in customer ka phone aur items", () => {
+  const walkIn = queryTransactions(
+    data,
+    { walkIn: true, type: "sale", period: "allTime" },
+    NOW,
+  );
+  assert.equal(walkIn.matched, 1);
+  assert.equal(walkIn.transactions[0].customerName, "Walk-in Customer");
+  assert.equal(walkIn.transactions[0].phone, "03009998877");
+  assert.match(walkIn.transactions[0].itemsText, /Soap/);
+
+  const byPhone = queryTransactions(
+    data,
+    { phone: "0300 999 8877", period: "allTime" },
+    NOW,
+  );
+  assert.equal(byPhone.matched, 1);
+  assert.equal(byPhone.transactions[0].id, "t7");
+});
+
+test("queryTransactions: item, search aur receipt se dhoondna", () => {
+  const chawal = queryTransactions(
+    data,
+    { itemName: "Chawal", period: "allTime" },
+    NOW,
+  );
+  assert.equal(chawal.matched, 1);
+  assert.equal(chawal.transactions[0].amount, 3000);
+
+  const receipt = queryTransactions(
+    data,
+    { receiptNo: "R261022-1001", period: "allTime" },
+    NOW,
+  );
+  assert.equal(receipt.matched, 2); // sale + sale ka cash
+
+  const text = queryTransactions(
+    data,
+    { search: "Ghee", period: "allTime" },
+    NOW,
+  );
+  assert.equal(text.matched, 1);
+  assert.equal(text.transactions[0].customerName, "Fahad Mehmood");
+});
+
+test("queryCustomers: lene/dene, phone aur sorting", () => {
+  const receivable = queryCustomers(data, { balanceKind: "receivable" });
+  assert.equal(receivable.matched, 2);
+  assert.equal(receivable.totals.receivable, 8500);
+  assert.equal(receivable.customers[0].name, "Fahad Mehmood");
+  assert.equal(receivable.customers[0].salesTotal, 7000);
+
+  const payable = queryCustomers(data, { balanceKind: "payable" });
+  assert.equal(payable.matched, 1);
+  assert.equal(payable.customers[0].name, "Bilal Ahmed");
+
+  const noPhone = queryCustomers(data, { hasPhone: false });
+  assert.equal(noPhone.matched, 1);
+  assert.equal(noPhone.customers[0].name, "Ali Raza");
+
+  const topBuyers = queryCustomers(data, { sort: "salesDesc", limit: 2 });
+  assert.equal(topBuyers.customers[0].name, "Fahad Mehmood");
+  assert.equal(topBuyers.customers[1].name, "Ali Khan");
+});
+
+test("getCustomerProfile: naam aur phone dono se mukammal profile", () => {
+  const profile = getCustomerProfile(data, { customerName: "Ali Khan" });
+  assert.equal(profile.found, true);
+  assert.equal(profile.balance.amount, 1500);
+  assert.equal(profile.lifetime.salesTotal, 3000);
+  assert.equal(profile.lifetime.creditGiven, 2000);
+  assert.equal(profile.lifetime.recovered, 500);
+  assert.equal(profile.lifetime.bills, 1);
+  assert.equal(profile.lifetime.payments, 1);
+  assert.equal(profile.entries.length, 3);
+  assert.equal(profile.topItems[0].name, "Chawal");
+  assert.match(profile.summary, /Rs\. 1,500/);
+
+  const byPhone = getCustomerProfile(data, { phone: "03001234567" });
+  assert.equal(byPhone.customer.name, "Ali Khan");
+
+  const ambiguous = getCustomerProfile(data, { customerName: "Ali" });
+  assert.equal(ambiguous.found, false);
+  assert.equal(ambiguous.ambiguous, true);
+  assert.equal(ambiguous.matches.length, 2);
+});
+
+test("getItemReport: item-wise sale, buyers aur cost ka note", () => {
+  const report = getItemReport(data, { period: "allTime" }, NOW);
+  assert.equal(report.totals.itemTypes, 4);
+  assert.equal(report.items[0].name, "Ghee");
+  assert.equal(report.items[0].revenue, 7000);
+  assert.equal(report.items[0].buyers, 1);
+  assert.equal(report.items[0].profit, null);
+  assert.match(report.items[0].profitNote, /cost/i);
+
+  const chawal = getItemReport(
+    data,
+    { period: "allTime", itemName: "Chawal" },
+    NOW,
+  );
+  assert.equal(chawal.items.length, 1);
+  assert.equal(chawal.items[0].qty, 2);
+  assert.equal(chawal.items[0].topBuyers[0].name, "Ali Khan");
+});
+
+test("getExpenseReport: category-wise totals aur tafseel", () => {
+  const all = getExpenseReport(data, { period: "allTime" }, NOW);
+  assert.equal(all.totals.total, 1300);
+  assert.equal(all.totals.entries, 2);
+  assert.equal(all.byCategory[0].category, "Rent");
+  assert.equal(all.byCategory[0].total, 1000);
+
+  const today = getExpenseReport(data, { period: "today" }, NOW);
+  assert.equal(today.totals.total, 300);
+  assert.equal(today.expenses[0].category, "Transport");
+});
+
+test("getDatabaseOverview: coverage, money, walk-in aur data quality", () => {
+  const overview = getDatabaseOverview(data);
+  assert.equal(overview.coverage.customers, 4);
+  assert.equal(overview.coverage.transactions, 7);
+  assert.equal(overview.coverage.expenses, 2);
+  assert.equal(overview.counts.sales, 4);
+  assert.equal(overview.counts.payments, 2);
+  assert.equal(overview.counts.salePayments, 1);
+  assert.equal(overview.money.salesTotal, 11700);
+  assert.equal(overview.money.creditGiven, 9000);
+  assert.equal(overview.money.recovered, 1300);
+  assert.equal(overview.money.expenses, 1300);
+  assert.equal(overview.money.profitEstimated, true);
+  assert.equal(overview.walkIn.bills, 1);
+  assert.equal(overview.walkIn.uniqueIdentifiedCustomers, 1);
+  assert.equal(overview.walkIn.withPhone, 1);
+  assert.equal(overview.walkIn.anonymousBills, 0);
+  assert.equal(overview.dataQuality.customersMissingPhone, 1);
+  assert.equal(overview.dataQuality.itemsMissingCost, 4);
+  assert.match(overview.summary, /4 customers/);
+});
+
+test("normalizeShopData: walk-in phone aur item cost mehfooz rehte hain", () => {
+  const clean = normalizeShopData({
+    customers: [],
+    transactions: [
+      {
+        id: "z",
+        type: "GAVE",
+        amount: 100,
+        paid: 100,
+        customerId: null,
+        customerName: "Walk-in Customer",
+        customerPhone: "03001234567",
+        createdAt: "2026-10-22T03:00:00.000Z",
+        items: [{ name: "X", qty: 1, price: 100, cost: 70 }],
+      },
+    ],
+    expenses: [],
+  });
+
+  assert.equal(clean.transactions[0].customerPhone, "03001234567");
+  assert.equal(clean.transactions[0].walkIn, true);
+  assert.equal(clean.transactions[0].items[0].cost, 70);
 });

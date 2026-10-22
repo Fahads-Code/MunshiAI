@@ -53,6 +53,10 @@ Authorization: Bearer <firebase-id-token>
 {
   "question": "Aaj kin customers ne udhaar par samaan liya?",
   "contextId": "firebase-uid",
+  "history": [
+    { "role": "user", "content": "Ali Khan ka balance?" },
+    { "role": "assistant", "content": "Ali Khan se Rs. 1,500 lene hain." }
+  ],
   "facts": { "period": "Aaj", "totalCreditGiven": 2000 },
   "deterministicAnswer": "### Aaj ka udhaar ..."
 }
@@ -61,6 +65,9 @@ Authorization: Bearer <firebase-id-token>
 - `question` — zaroori, max 600 characters.
 - `contextId` — optional, sirf traceability ke liye. User **hamesha** token se
   verify hota hai; body se `userId` accept nahi hota.
+- `history` — optional. Pichli 6 user/assistant messages (har ek max 800
+  characters) tak. Is se follow-up sawal chalte hain ("uska number kya hai?").
+  `system` role ignore hota hai.
 - `facts` / `deterministicAnswer` — optional. Frontend ke local deterministic
   engine ka verified answer; LLM fail hone par yahi wapas milta hai.
 
@@ -70,13 +77,16 @@ Response:
 {
   "answer": "Aaj **Ali Khan** ne **Rs. 2,000** ka udhaar liya ...",
   "model": "qwen/qwen3.8-27b",
-  "toolsUsed": [{ "name": "listCreditCustomers", "ok": true }],
+  "toolsUsed": [{ "name": "queryTransactions", "ok": true }],
+  "verifiedSummary": "Aaj: 4 entries mile (2 sale bills). Kul sale Rs. 3,500 ...",
   "source": "function-calling"
 }
 ```
 
-`source` in mein se ek hota hai: `function-calling`, `facts`, `context`,
-`deterministic`.
+`source` in mein se ek hota hai: `function-calling`, `tool-summary`, `facts`,
+`context`, `deterministic`. `tool-summary` tab aata hai jab LLM ka final jawab
+na bane (masalan rate limit) magar tool ne exact `summary` de di ho — numbers
+phir bhi backend ne calculate kiye hote hain.
 
 ### `POST /api/functions/:name`
 
@@ -133,14 +143,55 @@ function, `503` Firestore unavailable.
 | `listDefaulters` | `limit?` (1–50) | Jin se lena hai, sab se zyada pehle; advances aur settled count |
 | `listCreditCustomers` | `period?`, `from?`, `to?`, `limit?` | Kis ne kitna udhaar liya (bill + items) |
 | `listPayments` | `period?`, `from?`, `to?`, `limit?` | Purani wasooli kis customer se kitni aayi |
+| `queryTransactions` | `period?`, `type?`, `customerName?`, `customerId?`, `phone?`, `itemName?`, `receiptNo?`, `search?`, `walkIn?`, `minAmount?`, `maxAmount?`, `sort?`, `limit?`, `offset?` | Har transaction par exact filter/search; pura totals + pagination (`hasMore`, `nextOffset`) + har entry ka phone/items/receipt |
+| `queryCustomers` | `name?`, `phone?`, `search?`, `balanceKind?`, `minBalance?`, `maxBalance?`, `hasPhone?`, `sort?`, `limit?`, `offset?` | Poori customer list: lene/dene/settled, lifetime sale, wasooli, bills, average bill, aakhri activity |
+| `getCustomerProfile` | `customerId?`, `customerName?`, `phone?`, `includeEntries?`, `entriesLimit?` | Ek customer ka mukammal profile: phone, balance, lifetime totals, top items, aakhri entries |
+| `getItemReport` | `period?`, `from?`, `to?`, `itemName?`, `sort?`, `limit?` | Item-wise qty, revenue, buyers, top buyers, asli munafa (jahan cost saved ho) |
+| `getExpenseReport` | `period?`, `from?`, `to?`, `category?`, `search?`, `sort?`, `limit?`, `offset?` | Kharchon ki tafseel + category-wise exact totals |
+| `getDatabaseOverview` | — | Coverage (counts, date range), all-time money, walk-in summary, data quality (missing phone/cost/date) |
 
 `period`: `today`, `yesterday`, `last7days`, `thisMonth`, `lastMonth`,
-`allTime`, `custom` (`from`/`to` ISO dates ke saath). Default `today`.
-Din Pakistan time (UTC+5) ke hisaab se count hote hain.
+`allTime`, `custom` (`from`/`to` ISO dates ke saath). Default `today` — siwaye
+`queryTransactions`, `getItemReport`, `getExpenseReport` ke, jahan default
+`allTime` hai.
 
 **Cash double counting:** sale ke waqt jo cash mila wo `GAVE.paid` mein hai aur
 ek alag `GOT` entry (`source: "sale-payment"`) bhi banti hai. Is liye wasooli
 aur `calculateBalance` mein `sale-payment` entries ko skip kiya jata hai.
+
+**Pagination:** har list tool `matched`, `shown`, `hasMore` aur `nextOffset`
+deti hai. List kabhi chupke se truncate nahi hoti — assistant ko batana hota
+hai ke "kul X hain, Y dikhaye gaye". Agli entries ke liye `offset: nextOffset`.
+
+**LLM ko sirf 7 tools dikhte hain** (`queryTransactions`, `queryCustomers`,
+`getCustomerProfile`, `getSalesSummary`, `getItemReport`, `getExpenseReport`,
+`getDatabaseOverview`). Purane 6 tools (`searchCustomer`, `calculateBalance`,
+`listDefaulters`, `listCreditCustomers`, `listPayments`) endpoints par mojood
+hain magar har LLM request mein nahi bheje jate — is se token budget aur Groq
+ki rate limit bachti hai. `getSalesSummary` ke naye 7 tools mein se hai;
+baqi purane tools direct `/api/functions/:name` se call ho sakte hain.
+
+**Exact summary:** har naye tool ke result mein `summary` field hoti hai jo
+backend ne calculate ki hai (LLM ne nahi). Agar LLM final jawab na de sake to
+`/api/business-assistant` yahi summary wapas karta hai (`source:
+"tool-summary"`), is liye numbers phir bhi sahi rehte hain.
+
+### Poora database — accuracy ki hadd
+
+Assistant poore database par **live queries** chalata hai; wo data yaad nahi
+rakhta. Is liye jo record app mein maujood hai us par jawab exact hota hai.
+Lekin jo cheez kabhi save nahi hui, wo AI bhi nahi bata sakta:
+
+- **Walk-in customer ka phone/naam** — ab `NewSaleModal` se sale ke saath
+  `customerPhone` aur (optional) naam save hota hai. Is se pehle ki entries
+  mein yeh fields nahi hain; assistant unke liye saaf bolega "number saved
+  nahi".
+- **Purchase cost** — sirf wahan munafa exact hai jahan item ka `cost` saved
+  ho. Warna report `profit: null` aur note deti hai.
+- **Purana manual khata** — app se pehle ka data AI ke paas nahi.
+- **Free-text notes** — `search`/`itemName` se dhoondha ja sakta hai, magar
+  har lafz ka semantic search nahi (future: full-text index).
+
 
 ---
 

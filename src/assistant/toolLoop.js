@@ -36,6 +36,7 @@ export async function answerWithTools({
   question,
   facts,
   deterministicAnswer,
+  history = [],
   ctx,
   now = new Date(),
   maxRounds = MAX_ROUNDS,
@@ -45,11 +46,23 @@ export async function answerWithTools({
   loadData,
 }) {
   const toolsUsed = [];
+  let lastSummary = null;
+  const safeHistory = (Array.isArray(history) ? history : [])
+    .filter(
+      (h) =>
+        h &&
+        (h.role === "user" || h.role === "assistant") &&
+        typeof h.content === "string" &&
+        h.content.trim(),
+    )
+    .slice(-6)
+    .map((h) => ({ role: h.role, content: h.content.slice(0, 800) }));
   const messages = [
     {
       role: "system",
       content: systemPrompt || buildSystemPrompt({ now, hasFacts: Boolean(facts) }),
     },
+    ...safeHistory,
     {
       role: "user",
       content: buildUserContent({ question, facts, deterministicAnswer }),
@@ -60,6 +73,7 @@ export async function answerWithTools({
     return {
       answer: null,
       toolsUsed,
+      lastSummary,
       error: "unauthorized",
       messages,
     };
@@ -82,6 +96,7 @@ export async function answerWithTools({
       return {
         answer: null,
         toolsUsed,
+        lastSummary,
         model: result?.model ?? null,
         error: result?.error || "no_response",
         messages,
@@ -98,12 +113,13 @@ export async function answerWithTools({
         return {
           answer: null,
           toolsUsed,
+          lastSummary,
           model: result.model,
           error: "empty_answer",
           messages,
         };
       }
-      return { answer, toolsUsed, model: result.model, messages };
+      return { answer, toolsUsed, lastSummary, model: result.model, messages };
     }
 
     messages.push({
@@ -167,6 +183,12 @@ export async function answerWithTools({
         };
       }
 
+      if (
+        toolResult.ok !== false &&
+        typeof toolResult.data?.summary === "string"
+      ) {
+        lastSummary = toolResult.data.summary;
+      }
       toolsUsed.push({ name, arguments: args, ok: toolResult.ok !== false });
       messages.push({
         role: "tool",
@@ -180,6 +202,7 @@ export async function answerWithTools({
   return {
     answer: null,
     toolsUsed,
+    lastSummary,
     error: "max_rounds",
     messages,
   };

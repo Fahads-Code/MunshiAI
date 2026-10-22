@@ -268,6 +268,15 @@ app.post("/api/business-assistant", requireAuth, async (req, res) => {
       ? req.body.deterministicAnswer.slice(0, 4000)
       : "";
   const facts = boundedJson(req.body?.facts, 8000);
+  const history = (Array.isArray(req.body?.history) ? req.body.history : [])
+    .filter(
+      (h) =>
+        h &&
+        (h.role === "user" || h.role === "assistant") &&
+        typeof h.content === "string",
+    )
+    .slice(-6)
+    .map((h) => ({ role: h.role, content: h.content.slice(0, 800) }));
   const input = req.body?.context;
   const contextId =
     typeof req.body?.contextId === "string"
@@ -281,11 +290,13 @@ app.post("/api/business-assistant", requireAuth, async (req, res) => {
   const ctx = { uid: req.user.uid, idToken: req.idToken, contextId };
 
   // 1. FUNCTION-CALLING PATH: LLM khud live Firestore se data laata hai.
+  let toolRun = null;
   try {
-    const toolRun = await answerWithTools({
+    toolRun = await answerWithTools({
       question,
       facts: facts && typeof facts === "object" ? facts : undefined,
       deterministicAnswer,
+      history,
       ctx,
     });
 
@@ -297,6 +308,7 @@ app.post("/api/business-assistant", requireAuth, async (req, res) => {
           name: t.name,
           ok: t.ok,
         })),
+        verifiedSummary: toolRun.lastSummary || null,
         source: "function-calling",
       });
     }
@@ -308,6 +320,20 @@ app.post("/api/business-assistant", requireAuth, async (req, res) => {
     );
   } catch (err) {
     console.warn("Function-calling unexpected error:", err);
+  }
+
+  // 1b. LLM final jawab na de sake magar tool ka exact summary mojood ho:
+  // usi ko jawab bana do (numbers phir bhi code se aaye hue hain).
+  if (toolRun?.lastSummary) {
+    return res.json({
+      answer: toolRun.lastSummary,
+      toolsUsed: toolRun.toolsUsed.map((t) => ({
+        name: t.name,
+        ok: t.ok,
+      })),
+      verifiedSummary: toolRun.lastSummary,
+      source: "tool-summary",
+    });
   }
 
   // 2. FACTS FALLBACK: pre-computed verified facts (0% math error).

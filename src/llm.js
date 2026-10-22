@@ -63,6 +63,9 @@ export function callGroq(
   const body = {
     model,
     temperature,
+    // Chhota jawab kaafi hai; bara default Groq ki output-token rate limit
+    // reserve kar leta hai aur 429 aa jata hai.
+    max_tokens: 700,
     messages,
     ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
     ...(tools && tools.length ? { tools, tool_choice: toolChoice } : {}),
